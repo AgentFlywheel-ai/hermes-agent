@@ -31,6 +31,9 @@ _SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+_ZULIP_STREAM_RE = re.compile(r"^\s*(?:zulip:)?(?:(\d+)|([^:]+)):([^:]+)\s*$")
+_ZULIP_DM_RE = re.compile(r"^\s*(?:zulip:)?dm:([^@\s]+@[^@\s]+)\s*$")
+_ZULIP_GROUP_DM_RE = re.compile(r"^\s*(?:zulip:)?group_dm:([^\s]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # Platforms that address recipients by phone number and accept E.164 format
@@ -395,6 +398,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "zulip":
+        return _parse_zulip_target_ref(target_ref)
     if platform_name == "ntfy":
         topic = target_ref.strip()
         if topic:
@@ -418,6 +423,78 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
     return None, None, False
+
+
+def _parse_zulip_target_ref(target_ref: str):
+    """Parse Zulip targets: stream:topic (or id:topic), dm:email, group_dm:a@b,c@d .
+
+    Returns (chat_id, thread_id, is_explicit). Topic may contain ":" (use split 1).
+    """
+    if not target_ref:
+        return None, None, False
+    t = target_ref.strip()
+    if t.lower().startswith("zulip:"):
+        t = t[6:]
+    low = t.lower()
+    if low.startswith("dm:"):
+        m = _ZULIP_DM_RE.fullmatch("zulip:" + t)
+        if m:
+            return f"dm:{m.group(1)}", None, True
+        # fallback direct
+        email = t[3:].strip()
+        if "@" in email:
+            return f"dm:{email}", None, True
+    if low.startswith("group_dm:"):
+        m = _ZULIP_GROUP_DM_RE.fullmatch("zulip:" + t)
+        if m:
+            return f"group_dm:{m.group(1)}", None, True
+        rest = t[9:].strip()
+        if rest:
+            return f"group_dm:{rest}", None, True
+    # stream or id : topic (topic can contain ":")
+    if ":" in t:
+        # first : separates stream-ref from topic
+        stream_ref, topic = t.split(":", 1)
+        if stream_ref and topic:
+            # store as "streamref:topic" (adapter or delivery normalizes id vs name)
+            return f"{stream_ref}:{topic}", None, True
+    # bare topic in default stream? not explicit for cross send
+    return None, None, False
+
+
+async def _send_zulip(pconfig, chat_id: str, message: str) -> dict:
+    """Standalone Zulip send for the send_message tool (used when no live adapter)."""
+    try:
+        import zulip
+    except Exception:
+        return _error("zulip package not installed. Run: pip install 'hermes-agent[zulip]' or pip install zulip")
+    site = (getattr(pconfig, "extra", {}) or {}).get("site_url") or os.getenv("ZULIP_SITE_URL")
+    email = (getattr(pconfig, "extra", {}) or {}).get("bot_email") or os.getenv("ZULIP_BOT_EMAIL")
+    key = getattr(pconfig, "token", None) or os.getenv("ZULIP_API_KEY")
+    if not (site and email and key):
+        return _error("ZULIP_SITE_URL / ZULIP_BOT_EMAIL / ZULIP_API_KEY not configured")
+    try:
+        client = zulip.Client(site=site, email=email, api_key=key)
+        # Parse chat_id forms produced by _parse_zulip_target_ref + delivery
+        c = chat_id or ""
+        if c.startswith("dm:"):
+            to = c[3:]
+            req = {"type": "private", "to": [to], "content": message}
+        elif c.startswith("group_dm:"):
+            tos = [e.strip() for e in c[9:].split(",") if e.strip()]
+            req = {"type": "private", "to": tos, "content": message}
+        elif ":" in c:
+            # stream_name_or_id:topic  (topic may contain colons; we already split once upstream)
+            stream, topic = c.split(":", 1)
+            req = {"type": "stream", "to": stream, "topic": topic, "content": message}
+        else:
+            req = {"type": "stream", "to": c, "topic": "hermes", "content": message}
+        result = await asyncio.to_thread(client.send_message, req)
+        if result.get("result") == "success":
+            return {"success": True, "message_id": result.get("id")}
+        return _error(result.get("msg", "Zulip send failed"))
+    except Exception as e:
+        return _error(str(e))
 
 
 def _describe_media_for_mirror(media_files):
@@ -630,6 +707,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
+    _MAX_LENGTHS[Platform.ZULIP] = 4000
 
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
@@ -804,6 +882,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
+        elif platform == Platform.ZULIP:
+            result = await _send_zulip(pconfig, chat_id, chunk)
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.

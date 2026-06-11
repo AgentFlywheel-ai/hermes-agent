@@ -37,6 +37,10 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     chat_id = origin.get("chat_id")
     if not chat_id:
         return None
+    if origin.get("platform") == "zulip" and origin.get("chat_type") == "stream":
+        chat_topic = origin.get("chat_topic")
+        if chat_topic:
+            return f"{chat_id}:{chat_topic}"
     thread_id = origin.get("thread_id")
     if thread_id:
         return f"{chat_id}:{thread_id}"
@@ -45,6 +49,11 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
 
 def _session_entry_name(origin: Dict[str, Any]) -> str:
     base_name = origin.get("chat_name") or origin.get("user_name") or str(origin.get("chat_id"))
+    # Zulip streams show topic in the name
+    if origin.get("platform") == "zulip" and origin.get("chat_type") == "stream":
+        chat_topic = origin.get("chat_topic")
+        if chat_topic:
+            return f"{base_name} / {chat_topic}"
     thread_id = origin.get("thread_id")
     if not thread_id:
         return base_name
@@ -95,6 +104,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms[entry.name] = _build_from_sessions(entry.name)
     except Exception:
         pass
+
+    # Explicitly ensure zulip sessions are discovered
+    if "zulip" not in platforms:
+        platforms["zulip"] = _build_from_sessions("zulip")
 
     directory = {
         "updated_at": datetime.now().isoformat(),

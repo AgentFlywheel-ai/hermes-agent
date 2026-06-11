@@ -79,6 +79,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
+    ("zulip",            "💬 Zulip",                    "Zulip bot (DMs and streams)"),
     ("computer_use",     "🖱️  Computer Use (macOS)",     "background desktop control via cua-driver"),
 ]
 
@@ -1249,6 +1250,8 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
+    if get_env_value("ZULIP_API_KEY") and get_env_value("ZULIP_SITE_URL"):
+        enabled.append("zulip")
     return enabled
 
 

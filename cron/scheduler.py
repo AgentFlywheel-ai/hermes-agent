@@ -117,7 +117,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "zulip",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -138,7 +138,35 @@ _HOME_TARGET_ENV_VARS = {
     "bluebubbles": "BLUEBUBBLES_HOME_CHANNEL",
     "qqbot": "QQBOT_HOME_CHANNEL",
     "whatsapp": "WHATSAPP_HOME_CHANNEL",
+    "zulip": "ZULIP_HOME_CHANNEL",
 }
+
+def _split_delivery_targets(deliver: str) -> list[str]:
+    """Split a deliver string on commas, but preserve commas inside zulip group_dm targets.
+
+    A target like ``zulip:group_dm:a@b.com,c@d.com`` contains a comma that must not
+    be treated as a top-level separator when the user writes ``deliver=zulip:group_dm:a@b.com,c@d.com,origin``.
+    """
+    if "group_dm:" not in deliver:
+        return [p.strip() for p in deliver.split(",") if p.strip()]
+    parts = []
+    current = []
+    for segment in deliver.split(","):
+        if segment.strip().startswith("zulip:group_dm:"):
+            if current:
+                parts.append(",".join(current))
+            current = [segment.strip()]
+        elif current and current[0].startswith("zulip:group_dm:"):
+            current.append(segment.strip())
+        else:
+            if current:
+                parts.append(",".join(current))
+                current = []
+            if segment.strip():
+                parts.append(segment.strip())
+    if current:
+        parts.append(",".join(current))
+    return [p for p in parts if p]
 
 # Legacy env var names kept for back-compat.  Each entry is the current
 # primary env var → the previous name.  _get_home_target_chat_id falls
@@ -568,7 +596,7 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     if deliver == "local":
         return []
 
-    raw_parts = [p.strip() for p in deliver.split(",") if p.strip()]
+    raw_parts = _split_delivery_targets(deliver)
 
     # Expand routing intents.
     parts: List[str] = []
