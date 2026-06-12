@@ -179,6 +179,12 @@ COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
+# afai deploy: the [zulip] extra is lazy-install-only upstream (declared in
+# pyproject but absent from uv.lock), so `uv sync --frozen` never bakes it
+# and lazy_deps would try (unreliably) to install it at first boot in the
+# container. Bake it at build time so the gateway is never deaf to Zulip.
+RUN VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache-dir zulip==0.9.0
+
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
 # invalidate the (relatively slow) web + ui-tui build layer.
