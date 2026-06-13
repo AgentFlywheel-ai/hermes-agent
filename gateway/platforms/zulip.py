@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
@@ -102,6 +103,13 @@ def _extract_upload_image_paths(content: str) -> List[str]:
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+
+# Reconnect catch-up sweep (R1-06, ADR-A27 Revision R1).
+# On every (re-)register, fetch at most this many missed messages per stream.
+# Bounded to guard against a bad/zeroed watermark replaying unbounded history
+# (T-29-10). If the gap is larger, the sweep will miss old messages — that is
+# acceptable (the watermark was corrupted/missing; we default-safe to newest).
+_CATCHUP_NUM_AFTER = 100
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -1203,6 +1211,208 @@ class ZulipAdapter(BasePlatformAdapter):
         return None
 
     # ------------------------------------------------------------------
+    # Internal: reconnect catch-up (R1-06, ADR-A27 Revision R1)
+    # ------------------------------------------------------------------
+    #
+    # On every event-queue (re-)register — at boot and whenever
+    # call_on_each_event returns — we run a catch-up sweep for each
+    # free-response triage stream. The sweep fetches messages that
+    # arrived while the event queue was down (respawn gap, BAD_EVENT_QUEUE_ID
+    # expiry, etc.) from a per-stream watermark stored in a local state
+    # file, then dispatches them through the same _dispatch_inbound path
+    # the live queue uses. external_id dedup in the SOUL (R1-05) absorbs
+    # any boundary overlap so replayed messages do not double-file.
+    #
+    # Watermark semantics (T-29-09, T-29-10):
+    #   - Advance-after-process: the watermark moves forward only AFTER
+    #     a message is dispatched, so a crash mid-sweep replays rather
+    #     than skips (fail-safe; dedup catches the overlap).
+    #   - First-boot default: if no watermark exists for a stream, fetch
+    #     the newest message id and record it as the watermark with NO
+    #     back-fill. This avoids replaying all history on a clean first
+    #     start. Only a known-good watermark triggers a back-fill.
+    #   - Corrupted/zero watermark: if the stored value is <= 0 we treat
+    #     it as missing — safe to newest, no historical replay (T-29-10).
+
+    def _watermark_path(self) -> Path:
+        """Return the path to the per-stream catch-up watermark file.
+
+        Located in HERMES_HOME (same directory as memories/) so it survives
+        container restarts on the bind-mounted state volume, without
+        polluting the agent's MEMORY.md / system-prompt snapshot.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home() / "triage_catchup_watermarks.json"
+        except Exception:
+            # Fallback: beside this source file (dev/test environments).
+            return Path(__file__).parent / "triage_catchup_watermarks.json"
+
+    def _read_watermarks(self) -> Dict[str, int]:
+        """Load watermarks from disk. Returns {} on any error."""
+        path = self._watermark_path()
+        try:
+            text = path.read_text(encoding="utf-8")
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items() if isinstance(v, (int, float)) and int(v) > 0}
+        except Exception:
+            pass
+        return {}
+
+    def _write_watermark(self, stream_key: str, msg_id: int) -> None:
+        """Persist a single stream's watermark. Atomic write; errors are logged."""
+        path = self._watermark_path()
+        try:
+            # Read-modify-write under a best-effort lock (same process).
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+            existing[stream_key] = msg_id
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(existing), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.warning("Zulip: catch-up: failed to write watermark for %s: %s", stream_key, exc)
+
+    def _run_catchup_sweep(self) -> None:
+        """Back-fill missed messages for each free-response triage stream.
+
+        Runs synchronously in the event-queue thread immediately before
+        (re-)registering the live event queue.  Any messages returned by
+        get_messages are dispatched via asyncio.run_coroutine_threadsafe
+        onto the main event loop — identical to the live-queue path.
+
+        Streams are identified by name (lower-cased) as stored in
+        _free_response_streams. Only streams the bot is subscribed to and
+        whose name appears in _free_response_streams are swept.
+        """
+        if not self._free_response_streams:
+            return
+        if not self._client:
+            return
+        if not self._loop or self._loop.is_closed():
+            return
+
+        watermarks = self._read_watermarks()
+        send_client = self._build_send_client()
+
+        for stream_key in sorted(self._free_response_streams):
+            if self._closing:
+                return
+            # Resolve stream_id from the cache (populated in connect()).
+            stream_id = self._stream_id_cache.get(stream_key)
+            if stream_id is None:
+                logger.debug(
+                    "Zulip: catch-up: stream %r not in stream cache — skipping", stream_key
+                )
+                continue
+
+            watermark = watermarks.get(stream_key, 0)
+
+            if watermark <= 0:
+                # No watermark yet — record current newest as baseline (no back-fill).
+                try:
+                    result = send_client.get_messages({
+                        "anchor": "newest",
+                        "num_before": 1,
+                        "num_after": 0,
+                        "narrow": [["stream", stream_key]],
+                        "apply_markdown": False,
+                    })
+                    if result.get("result") == "success":
+                        msgs = result.get("messages", [])
+                        if msgs:
+                            newest_id = msgs[-1].get("id", 0)
+                            if newest_id > 0:
+                                self._write_watermark(stream_key, newest_id)
+                                logger.info(
+                                    "Zulip: catch-up: stream %r — first boot, watermark seeded at id=%d",
+                                    stream_key, newest_id,
+                                )
+                except Exception as exc:
+                    logger.warning(
+                        "Zulip: catch-up: failed to seed watermark for %r: %s", stream_key, exc
+                    )
+                continue
+
+            # Back-fill: fetch messages after the watermark.
+            logger.info(
+                "Zulip: catch-up: stream %r — sweeping from watermark+1=%d",
+                stream_key, watermark + 1,
+            )
+            try:
+                result = send_client.get_messages({
+                    "anchor": watermark + 1,
+                    "num_before": 0,
+                    "num_after": _CATCHUP_NUM_AFTER,
+                    "narrow": [["stream", stream_key]],
+                    "apply_markdown": False,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Zulip: catch-up: get_messages failed for %r: %s", stream_key, exc
+                )
+                continue
+
+            if result.get("result") != "success":
+                logger.debug(
+                    "Zulip: catch-up: get_messages error for %r — %s",
+                    stream_key, result.get("msg", "unknown"),
+                )
+                continue
+
+            messages = result.get("messages", [])
+            replayed = 0
+            for msg in messages:
+                if self._closing:
+                    return
+                msg_id = msg.get("id", 0)
+                if msg_id <= watermark:
+                    continue  # already processed (anchor overlap)
+
+                # Skip self-messages.
+                if (msg.get("sender_email") == self._bot_email
+                        or msg.get("sender_id") == self._bot_user_id):
+                    self._write_watermark(stream_key, msg_id)
+                    continue
+
+                # Skip whitespace-only content.
+                if not (msg.get("content") or "").strip():
+                    self._write_watermark(stream_key, msg_id)
+                    continue
+
+                # Dispatch through the same path as the live event queue.
+                # The raw_event shape used by _dispatch_inbound only needs
+                # type + message; we synthesize a minimal event envelope.
+                raw_event: Dict[str, Any] = {"type": "message", "message": msg}
+                logger.debug(
+                    "Zulip: catch-up: replaying msg_id=%d from stream %r",
+                    msg_id, stream_key,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    self._dispatch_inbound(msg, raw_event), self._loop
+                )
+
+                # Advance watermark AFTER dispatch (replay-on-crash, not skip).
+                self._write_watermark(stream_key, msg_id)
+                replayed += 1
+
+            if replayed:
+                logger.info(
+                    "Zulip: catch-up: stream %r — replayed %d missed message(s)",
+                    stream_key, replayed,
+                )
+            else:
+                logger.debug(
+                    "Zulip: catch-up: stream %r — no gap (watermark=%d up to date)",
+                    stream_key, watermark,
+                )
+
+    # ------------------------------------------------------------------
     # Internal: event queue
     # ------------------------------------------------------------------
 
@@ -1221,6 +1431,15 @@ class ZulipAdapter(BasePlatformAdapter):
         self._consecutive_failures = 0
 
         while not self._closing:
+            # Catch-up sweep (R1-06): back-fill any messages missed while the
+            # event queue was down (respawn, BAD_EVENT_QUEUE_ID, etc.) before
+            # registering the new live queue.  Runs on every (re-)register so
+            # both the boot case and mid-run queue expiry are covered.
+            self._run_catchup_sweep()
+
+            if self._closing:
+                return
+
             try:
                 self._client.call_on_each_event(
                     self._on_zulip_event,
@@ -1340,6 +1559,23 @@ class ZulipAdapter(BasePlatformAdapter):
             asyncio.run_coroutine_threadsafe(
                 self._dispatch_inbound(message, event), self._loop
             )
+
+        # Advance the catch-up watermark for free-response triage streams
+        # so the next (re-)register sweep starts from a current position and
+        # doesn't replay messages the live queue already handled (R1-06).
+        if self._free_response_streams and msg_id and message.get("type") == "stream":
+            stream_name = ""
+            dr = message.get("display_recipient")
+            if isinstance(dr, str):
+                stream_name = dr.lower()
+            elif isinstance(dr, dict):
+                stream_name = dr.get("name", "").lower()
+            stream_id_val = str(message.get("stream_id", ""))
+            if (stream_name in self._free_response_streams
+                    or stream_id_val in self._free_response_streams):
+                int_id = message.get("id", 0)
+                if int_id > 0:
+                    self._write_watermark(stream_name or stream_id_val, int_id)
 
     async def _fetch_context(
         self, stream_name: str, topic: str
