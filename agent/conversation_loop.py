@@ -1588,6 +1588,13 @@ def run_conversation(
                             )
                     continue  # Retry the API call
 
+                # m2-llm-spend-ledger Seam 2 (U3/C2): emit one tagged llm_usage line per
+                # completed Bedrock turn (fail-open, stdout only — the tenant Vector ships it
+                # to the central O2 llm_usage stream). See agent/llm_usage_emit.py.
+                if agent.api_mode == "bedrock_converse":
+                    from agent.llm_usage_emit import emit_bedrock_turn
+                    emit_bedrock_turn(agent, response)
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
