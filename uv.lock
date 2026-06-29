@@ -1627,6 +1627,7 @@ youtube = [
     { name = "youtube-transcript-api" },
 ]
 zulip = [
+    { name = "httpx", extra = ["socks"] },
     { name = "zulip" },
 ]
 
@@ -1690,6 +1691,7 @@ requires-dist = [
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.0.1" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
+    { name = "httpx", extras = ["socks"], marker = "extra == 'zulip'", specifier = "==0.28.1" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.5.3" },
     { name = "markdown", specifier = "==3.10.2" },
