@@ -157,11 +157,28 @@ def emit_bedrock_turn(agent, response):
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
-            # No usage on the turn — nothing meaningful to report. A validated Bedrock
-            # response always carries usage, so this only drops a degenerate/garbage call.
+            # No usage on the turn. Emit a non-tagged debug line to stderr (which reaches the
+            # container docker stream; NOT the LLM_USAGE_EVENT tag, so Vector's route ignores
+            # it) so a still-broken deploy is diagnosable from one live turn.
+            sys.stderr.write(
+                "AFAI_USAGE_DEBUG no-usage api_mode=%s provider=%s resp=%s\n"
+                % (getattr(agent, "api_mode", None), getattr(agent, "provider", None),
+                   type(response).__name__)
+            )
+            sys.stderr.flush()
             return
-        tokens_in = getattr(usage, "prompt_tokens", 0)
-        tokens_out = getattr(usage, "completion_tokens", 0)
+        # Usage attr names differ by adapter: bedrock_converse builds prompt_tokens/
+        # completion_tokens; other paths may expose input_tokens/output_tokens or a dict.
+        def _u(*names):
+            for n in names:
+                v = getattr(usage, n, None)
+                if v is None and isinstance(usage, dict):
+                    v = usage.get(n)
+                if v is not None:
+                    return v
+            return 0
+        tokens_in = _u("prompt_tokens", "input_tokens", "inputTokens")
+        tokens_out = _u("completion_tokens", "output_tokens", "outputTokens")
         model = getattr(response, "model", None) or getattr(agent, "model", None)
 
         realm = os.environ.get("TENANT_NAME", "") or "unknown"
@@ -186,10 +203,12 @@ def emit_bedrock_turn(agent, response):
             tokens_in=tokens_in,
             tokens_out=tokens_out,
         )
-        # Raw stdout line (NOT via logging — see module docstring). flush so the line reaches
-        # the container log promptly for Vector to tail.
-        sys.stdout.write(format_event_line(event) + "\n")
-        sys.stdout.flush()
+        # Raw line to STDERR (NOT stdout, NOT logging). Under s6-overlay the gateway's stdout
+        # is captured to an s6 logfile and never reaches the container docker stream Vector
+        # tails; the gateway's stderr DOES reach it. A bare (un-prefixed) line preserves the
+        # `LLM_USAGE_EVENT ` prefix Vector's route matches. flush so it ships promptly.
+        sys.stderr.write(format_event_line(event) + "\n")
+        sys.stderr.flush()
     except Exception:
         # Fail-open: a telemetry failure must never propagate into the agent's turn.
         return
