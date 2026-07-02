@@ -152,8 +152,8 @@ def test_emit_writes_one_c1_valid_line(capsys, monkeypatch):
     monkeypatch.setenv("TENANT_NAME", "movementlens")
     emit_bedrock_turn(_zulip_stream_agent(), _bedrock_response())
 
-    out = capsys.readouterr().out.strip()
-    assert out.startswith(TAG + " ")  # exactly the tagged stdout line Vector tails
+    out = capsys.readouterr().err.strip()  # stderr: the channel that reaches the docker stream under s6
+    assert out.startswith(TAG + " ")  # exactly the tagged line Vector tails
 
     event = json.loads(out[len(TAG) + 1:])
     # Fixture assertion: the captured emitted line carries the full C1 required set ...
@@ -167,14 +167,16 @@ def test_emit_writes_one_c1_valid_line(capsys, monkeypatch):
 
 
 def test_emit_is_fail_open_on_broken_inputs(capsys):
-    # A response with no usage / a bare object must never raise and must not emit junk.
+    # A response with no usage / a bare object must never raise and must not emit a usage line.
     emit_bedrock_turn(object(), object())
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert TAG not in captured.err  # only a non-tagged AFAI_USAGE_DEBUG line, never a usage row
 
 
-def test_emit_never_raises_even_if_stdout_explodes(monkeypatch):
+def test_emit_never_raises_even_if_stderr_explodes(monkeypatch):
     # Even if the write itself fails, the turn must not see an exception.
     import agent.llm_usage_emit as m
 
-    monkeypatch.setattr(m.sys.stdout, "write", lambda *_: (_ for _ in ()).throw(IOError("boom")))
+    monkeypatch.setattr(m.sys.stderr, "write", lambda *_: (_ for _ in ()).throw(IOError("boom")))
     emit_bedrock_turn(_zulip_stream_agent(), _bedrock_response())  # no raise == pass
