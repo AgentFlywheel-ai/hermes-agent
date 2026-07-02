@@ -1591,7 +1591,11 @@ def run_conversation(
                 # m2-llm-spend-ledger Seam 2 (U3/C2): emit one tagged llm_usage line per
                 # completed Bedrock turn (fail-open, stdout only — the tenant Vector ships it
                 # to the central O2 llm_usage stream). See agent/llm_usage_emit.py.
-                if agent.api_mode == "bedrock_converse":
+                # afai: fire for ANY Bedrock access mode. provider=="bedrock" is set from
+                # config regardless of whether the transport resolves to bedrock_converse or
+                # the Anthropic-Messages-on-Bedrock adapter, so gating on api_mode alone
+                # silently dropped every turn when the resolved mode wasn't bedrock_converse.
+                if agent.api_mode == "bedrock_converse" or getattr(agent, "provider", "") == "bedrock":
                     from agent.llm_usage_emit import emit_bedrock_turn
                     emit_bedrock_turn(agent, response)
 
