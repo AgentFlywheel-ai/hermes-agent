@@ -104,6 +104,25 @@ Result:
 - `create_issue` is still allowed
 - `delete_issue` is ignored because `include` takes precedence
 
+## Per-turn credential
+
+```yaml
+mcp_servers:
+  tenant:
+    url: https://product.example/mcp
+    headers:
+      Authorization: "Bearer ${TENANT_DISCOVERY_TOKEN}"
+    per_turn_credential: true
+```
+
+With `per_turn_credential: true`, the static `Authorization` header is presented on
+`initialize`, `ping` and `tools/list` (including any reconnect or re-list), and the
+credential carried by the API server's `X-Hermes-Tool-Credential` request header is
+presented as the bearer on `tools/call` only. A `tools/call` with no credential bound to
+the current turn is refused before it is sent. The credential is never logged, never
+exported to subprocess environments, and never reaches the model. Mutually exclusive
+with `auth: oauth`.
+
 ## Utility-tool policy
 
 Hermes may register these utility wrappers per MCP server:
