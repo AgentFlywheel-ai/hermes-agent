@@ -3518,7 +3518,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # for this turn. Read here, in the agent's own context, because the MCP
         # loop runs on another thread whose context does not inherit it.
         per_turn_bearer = None
-        if (getattr(server, "_config", None) or {}).get("per_turn_credential"):
+        _cfg = getattr(server, "_config", None)
+        if isinstance(_cfg, dict) and bool(_cfg.get("per_turn_credential")):
             from gateway.session_context import get_tool_credential
             per_turn_bearer = get_tool_credential()
             if not per_turn_bearer:
