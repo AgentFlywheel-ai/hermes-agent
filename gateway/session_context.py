@@ -86,6 +86,13 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Per-turn tool credential (afai platform-access): a bearer the calling product
+# minted for the asking user and this turn, applied by the MCP client to
+# ``tools/call`` on servers that opt in. Deliberately NOT in ``_VAR_MAP``: it
+# is never exported to a subprocess environment by the env bridge, never read
+# back from ``os.environ``, and never reaches the model or the transcript.
+_SESSION_TOOL_CREDENTIAL: ContextVar = ContextVar("HERMES_SESSION_TOOL_CREDENTIAL", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -160,6 +167,7 @@ def set_session_vars(
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    tool_credential: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -194,6 +202,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_TOOL_CREDENTIAL.set(tool_credential or ""),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -234,12 +243,23 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_TOOL_CREDENTIAL.set("")
     try:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
     except Exception:
         pass
+
+
+def get_tool_credential() -> str:
+    """The per-turn tool credential bound to this context, or ``""``.
+
+    No ``os.environ`` fallback: a credential exists only while the turn that
+    carried it is running, and only in the context that bound it.
+    """
+    value = _SESSION_TOOL_CREDENTIAL.get()
+    return "" if value is _UNSET else value
 
 
 def reset_session_vars() -> None:
@@ -282,6 +302,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_TOOL_CREDENTIAL.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

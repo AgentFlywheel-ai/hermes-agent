@@ -1456,6 +1456,30 @@ class ElicitationHandler:
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
 
+def _per_call_bearer_auth(server: "MCPServerTask"):
+    """httpx auth that swaps in the per-turn bearer for the tools/call in flight.
+
+    Servers configured with ``per_turn_credential: true`` present a static
+    (discovery) bearer from ``headers`` on initialize, ping and tools/list,
+    and the credential the calling product minted for the asking user on
+    ``tools/call`` only. Calls serialize under the server's rpc lock, so one
+    attribute on the task identifies the current call unambiguously.
+    """
+    import httpx
+
+    class _PerCallBearerAuth(httpx.Auth):
+        requires_request_body = False
+        requires_response_body = False
+
+        def auth_flow(self, request):
+            bearer = server._call_bearer
+            if bearer:
+                request.headers["Authorization"] = f"Bearer {bearer}"
+            yield request
+
+    return _PerCallBearerAuth()
+
+
 class MCPServerTask:
     """Manages a single MCP server connection in a dedicated asyncio Task.
 
@@ -1473,7 +1497,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_call_bearer",
         "initialize_result", "_ping_unsupported",
     )
 
@@ -1506,6 +1530,10 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
+        # Per-turn bearer for the tools/call in flight, set under _rpc_lock by
+        # the tool handler and read by _per_call_bearer_auth. None outside a
+        # call, so initialize/ping/tools/list carry the static discovery bearer.
+        self._call_bearer: Optional[str] = None
         # contextvars snapshot of the agent task that's currently in
         # session.call_tool(). The MCP recv loop dispatches incoming
         # elicitation/create requests on a SEPARATE asyncio task whose
@@ -2179,6 +2207,12 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
+            if config.get("per_turn_credential"):
+                if _oauth_auth is not None:
+                    raise ValueError(
+                        f"MCP server '{self.name}': per_turn_credential and auth: oauth are mutually exclusive"
+                    )
+                _sse_kwargs["auth"] = _per_call_bearer_auth(self)
             if client_cert is not None or ssl_verify is not True:
                 # SSE transport doesn't expose verify/cert as kwargs, so route
                 # them through an httpx_client_factory that wraps the SDK's
@@ -2257,6 +2291,12 @@ class MCPServerTask:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
+            if config.get("per_turn_credential"):
+                if _oauth_auth is not None:
+                    raise ValueError(
+                        f"MCP server '{self.name}': per_turn_credential and auth: oauth are mutually exclusive"
+                    )
+                client_kwargs["auth"] = _per_call_bearer_auth(self)
             if client_cert is not None:
                 client_kwargs["cert"] = client_cert
 
@@ -2290,6 +2330,12 @@ class MCPServerTask:
             }
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
+            if config.get("per_turn_credential"):
+                if _oauth_auth is not None:
+                    raise ValueError(
+                        f"MCP server '{self.name}': per_turn_credential and auth: oauth are mutually exclusive"
+                    )
+                _http_kwargs["auth"] = _per_call_bearer_auth(self)
             async with streamablehttp_client(url, **_http_kwargs) as (
                 read_stream, write_stream, _get_session_id,
             ):
@@ -3467,6 +3513,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        # Per-turn credential (afai platform-access): a server that opts in
+        # never calls a tool without the credential the calling product minted
+        # for this turn. Read here, in the agent's own context, because the MCP
+        # loop runs on another thread whose context does not inherit it.
+        per_turn_bearer = None
+        if (getattr(server, "_config", None) or {}).get("per_turn_credential"):
+            from gateway.session_context import get_tool_credential
+            per_turn_bearer = get_tool_credential()
+            if not per_turn_bearer:
+                return json.dumps({
+                    "error": (
+                        f"MCP server '{server_name}' requires a per-turn tool credential "
+                        f"and none is bound to this turn; the lookup is unavailable."
+                    ),
+                    "unavailable": True,
+                }, ensure_ascii=False)
+
         async def _call():
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
@@ -3474,10 +3537,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
+                server._call_bearer = per_turn_bearer
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
+                    server._call_bearer = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""

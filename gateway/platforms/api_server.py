@@ -1084,6 +1084,8 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    # Cap for the per-turn tool credential; product-minted tokens are JWT-sized.
+    _MAX_TOOL_CREDENTIAL_LEN = 4096
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -1132,6 +1134,52 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(raw) > self._MAX_SESSION_HEADER_LEN:
             return None, web.json_response(
                 {"error": {"message": "Session key too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        return raw, None
+
+    def _parse_tool_credential_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the ``X-Hermes-Tool-Credential`` header.
+
+        A per-turn credential the calling product minted for the asking user
+        and this turn. It is bound into the session context for the run and
+        applied by the MCP client as the bearer on ``tools/call`` for servers
+        configured with ``per_turn_credential: true``. It is never logged,
+        never echoed, never persisted, and never reaches the model.
+
+        Requires API-key authentication, like the session headers: an
+        unauthenticated caller must not be able to attach a credential to a
+        turn on a local-only server.
+        """
+        raw = request.headers.get("X-Hermes-Tool-Credential", "").strip()
+        if not raw:
+            return None, None
+
+        if not self._api_key:
+            logger.warning(
+                "X-Hermes-Tool-Credential rejected: no API key configured. "
+                "Set API_SERVER_KEY to enable per-turn tool credentials."
+            )
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Tool-Credential requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        if any(ord(c) < 32 or ord(c) > 126 for c in raw):
+            return None, web.json_response(
+                {"error": {"message": "Invalid tool credential", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if len(raw) > self._MAX_TOOL_CREDENTIAL_LEN:
+            return None, web.json_response(
+                {"error": {"message": "Tool credential too long", "type": "invalid_request_error"}},
                 status=400,
             )
 
@@ -2127,6 +2175,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        tool_credential, cred_err = self._parse_tool_credential_header(request)
+        if cred_err:
+            return cred_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2278,6 +2329,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                tool_credential=tool_credential,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -2298,6 +2350,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_credential=tool_credential,
                 route=route,
             )
 
@@ -3992,6 +4045,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        tool_credential: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4016,6 +4070,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
+            tool_credential=tool_credential,
         )
 
     async def _run_agent(
@@ -4031,6 +4086,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        tool_credential: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4056,6 +4112,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
+                tool_credential=tool_credential or "",
             )
             try:
                 agent = self._create_agent(
