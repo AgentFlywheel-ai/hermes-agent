@@ -119,6 +119,13 @@ def _install_stub_server(name: str = "wpcom"):
     class _EventAdapter:
         def set(self):
             reconnect_flag.set()
+            # A reconnect attaches a NEW session; the retry must run on it,
+            # never on the one that raised. Carry the stubbed RPCs over.
+            fresh = MagicMock()
+            for rpc in ("call_tool", "list_resources", "read_resource",
+                        "list_prompts", "get_prompt"):
+                setattr(fresh, rpc, getattr(server.session, rpc))
+            server.session = fresh
 
     server._reconnect_event = _EventAdapter()
 

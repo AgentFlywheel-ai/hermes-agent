@@ -332,6 +332,11 @@ _MAX_BACKOFF_SECONDS = 60
 # stops a misconfigured tiny interval from busy-looping the keepalive.
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
+_KEEPALIVE_PROBE_TIMEOUT = 30.0    # a probe slower than this is a dead session
+
+# How long a caller waits for a rebuilt transport to attach a NEW session
+# before giving up (session-expired retry, half-open breaker probe).
+_FRESH_SESSION_WAIT_SEC = 15.0
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1762,7 +1767,7 @@ class MCPServerTask:
         """
         if not self._ping_unsupported:
             try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
+                await _await_bounded(self.session.send_ping(), _KEEPALIVE_PROBE_TIMEOUT)
                 return
             except Exception as exc:
                 # Only a "method not found" means ping is unsupported. Any
@@ -1782,7 +1787,17 @@ class MCPServerTask:
                 )
 
         # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+        await _await_bounded(self.session.list_tools(), _KEEPALIVE_PROBE_TIMEOUT)
+
+    def _attach_session(self, session) -> None:
+        """Make ``session`` the live session, with its own RPC lock.
+
+        The lock is per connection: an RPC wedged on a discarded session
+        keeps holding only that session's lock, so it can never block the
+        replacement session's tool discovery or calls.
+        """
+        self._rpc_lock = asyncio.Lock()
+        self.session = session
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
@@ -1864,6 +1879,11 @@ class MCPServerTask:
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()
+        # Detach the session before the transport tears down: teardown of a
+        # wedged transport can take as long as its HTTP read timeout, and a
+        # call issued meanwhile must fail fast as "reconnecting" instead of
+        # queueing on the session being discarded.
+        self.session = None
         return "reconnect"
 
     async def _wait_for_reconnect_or_shutdown(self) -> str:
@@ -2006,7 +2026,7 @@ class MCPServerTask:
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     self.initialize_result = await session.initialize()
-                    self.session = session
+                    self._attach_session(session)
                     await self._discover_tools()
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
@@ -2249,7 +2269,7 @@ class MCPServerTask:
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     self.initialize_result = await session.initialize()
-                    self.session = session
+                    self._attach_session(session)
                     await self._discover_tools()
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
@@ -2308,7 +2328,7 @@ class MCPServerTask:
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         self.initialize_result = await session.initialize()
-                        self.session = session
+                        self._attach_session(session)
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from
@@ -2341,7 +2361,7 @@ class MCPServerTask:
             ):
                 async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                     self.initialize_result = await session.initialize()
-                    self.session = session
+                    self._attach_session(session)
                     await self._discover_tools()
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
@@ -2746,6 +2766,42 @@ def _signal_reconnect(server: Any) -> bool:
     return True
 
 
+def _wait_for_fresh_session(server: Any, stale: Any, budget: Optional[float] = None) -> bool:
+    """Block the calling thread until ``server`` has a live session other than ``stale``.
+
+    A reconnect is only complete when a NEW session is attached: ``_ready``
+    stays set across reconnects and the discarded session object can linger
+    until teardown finishes, so neither is evidence of recovery on its own.
+    Polls by step count rather than a clock deadline so callers stay bounded
+    even where ``time.monotonic`` is patched.
+    """
+    budget = _FRESH_SESSION_WAIT_SEC if budget is None else budget
+    step = 0.05
+    for _ in range(max(1, int(budget / step))):
+        live = server.session
+        if live is not None and live is not stale and server._ready.is_set():
+            return True
+        time.sleep(step)
+    return False
+
+
+async def _await_bounded(awaitable, timeout: float):
+    """Await ``awaitable`` for at most ``timeout`` seconds.
+
+    Unlike ``asyncio.wait_for``, the deadline holds even when the awaitable
+    does not honour cancellation (``wait_for`` waits for the cancelled task
+    to finish, so a probe wedged inside a transport can hang it forever).
+    On timeout the task is cancelled and abandoned, and ``TimeoutError``
+    is raised.
+    """
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if task in done:
+        return task.result()
+    task.cancel()
+    raise TimeoutError(f"no response within {timeout:.1f}s")
+
+
 # ---------------------------------------------------------------------------
 # Auth-failure detection helpers (Task 6 of MCP OAuth consolidation)
 # ---------------------------------------------------------------------------
@@ -2874,9 +2930,10 @@ def _handle_auth_error_and_retry(
         if srv is not None and hasattr(srv, "_reconnect_event"):
             loop = _mcp_loop
             if loop is not None and loop.is_running():
+                stale = srv.session
                 loop.call_soon_threadsafe(srv._reconnect_event.set)
 
-                # Wait briefly for the session to come back ready. Bounded
+                # Wait briefly for the NEW session to come back ready. Bounded
                 # so that a stuck reconnect falls through to the error
                 # path rather than hanging the caller.  The async helper
                 # runs on the MCP event loop via _run_on_mcp_loop so it
@@ -2884,7 +2941,8 @@ def _handle_auth_error_and_retry(
                 async def _await_ready() -> bool:
                     deadline = time.monotonic() + 15
                     while time.monotonic() < deadline:
-                        if srv.session is not None and srv._ready.is_set():
+                        live = srv.session
+                        if live is not None and live is not stale and srv._ready.is_set():
                             return True
                         await asyncio.sleep(0.25)
                     return False
@@ -3001,6 +3059,10 @@ def _handle_session_expired_and_retry(
     and rebuild them, reusing the existing OAuth provider instance.
     See #13383.
 
+    A call that timed out also requests the rebuild, but is not retried
+    (it may have executed server-side); ``None`` is returned so the caller
+    reports the timeout.
+
     Args:
         server_name: Name of the MCP server that raised.
         exc: The exception from the failed call.
@@ -3014,6 +3076,21 @@ def _handle_session_expired_and_retry(
         generic error path (not a session-expired error, no server
         record, reconnect didn't ready in time, or retry also failed).
     """
+    if isinstance(exc, TimeoutError):
+        # A call that outlives its timeout is the only symptom some wedges
+        # show (a stuck transport writer, an RPC lock never released). The
+        # call may have executed server-side, so it is not retried; the
+        # transport is rebuilt so the NEXT call runs on a fresh session.
+        with _lock:
+            srv = _servers.get(server_name)
+        if srv is not None and _signal_reconnect(srv):
+            logger.warning(
+                "MCP server '%s': %s timed out; rebuilding the transport "
+                "session so later calls do not queue on a wedged one.",
+                server_name, op_description,
+            )
+        return None
+
     if not _is_session_expired_error(exc):
         return None
 
@@ -3032,21 +3109,17 @@ def _handle_session_expired_and_retry(
         server_name, op_description, exc,
     )
 
-    # Trigger the same reconnect mechanism the OAuth recovery path
-    # uses, then wait briefly for the new session to come back ready.
+    # Trigger the same reconnect mechanism the OAuth recovery path uses,
+    # then wait for a NEW session. The expired one can stay attached until
+    # its teardown runs; retrying on it would wait out the full tool timeout
+    # while holding that session's RPC lock.
+    stale = srv.session
     loop.call_soon_threadsafe(srv._reconnect_event.set)
-    deadline = time.monotonic() + 15
-    ready = False
-    while time.monotonic() < deadline:
-        if srv.session is not None and srv._ready.is_set():
-            ready = True
-            break
-        time.sleep(0.25)
-    if not ready:
+    if not _wait_for_fresh_session(srv, stale):
         logger.warning(
-            "MCP server '%s': reconnect did not ready within 15s after "
+            "MCP server '%s': no fresh session within %.0fs after "
             "session-expired error; falling through to error response.",
-            server_name,
+            server_name, _FRESH_SESSION_WAIT_SEC,
         )
         return None
 
@@ -3466,6 +3539,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
+        half_open = False
         if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
             opened_at = _server_breaker_opened_at.get(server_name, 0.0)
             age = time.monotonic() - opened_at
@@ -3481,6 +3555,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
+            half_open = True
 
         with _lock:
             server = _servers.get(server_name)
@@ -3512,6 +3587,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
+
+        if half_open:
+            # The probe never runs on the session that tripped the breaker:
+            # whatever wedged it (an expired server-side session, a stuck
+            # transport, an RPC lock never released) would fail the probe
+            # again and re-arm the breaker indefinitely. Rebuild first and
+            # probe on the fresh session.
+            stale = server.session
+            if not (_signal_reconnect(server) and _wait_for_fresh_session(server, stale)):
+                _bump_server_error(server_name)
+                return json.dumps({
+                    "error": (
+                        f"MCP server '{server_name}' transport is being rebuilt; "
+                        f"reconnect requested. Do NOT retry this tool "
+                        f"immediately — give it a few seconds to come back."
+                    )
+                }, ensure_ascii=False)
 
         # Per-turn credential (afai platform-access): a server that opts in
         # never calls a tool without the credential the calling product minted
@@ -4314,15 +4406,34 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     #   tools.exclude — blacklist: all tools EXCEPT these are registered
     #   include takes precedence over exclude
     #   Neither set → register all tools (backward-compatible default)
+    #   tools.exclude_match: casefold — exclusions compare strip()+casefold()
+    #   on both sides, so a server that publishes its own catalog cannot
+    #   re-expose an excluded tool under another spelling. Include matching
+    #   and servers without the key stay literal.
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
+    exclude_match = tools_filter.get("exclude_match")
+    if exclude_match not in (None, "literal", "casefold"):
+        logger.warning(
+            "MCP config mcp_servers.%s.tools.exclude_match must be 'literal' or "
+            "'casefold'; ignoring %r and matching exclusions literally",
+            name, exclude_match,
+        )
+        exclude_match = None
+    if exclude_match == "casefold":
+        def _exclude_key(tool_name: str) -> str:
+            return str(tool_name).strip().casefold()
+    else:
+        def _exclude_key(tool_name: str) -> str:
+            return tool_name
+    exclude_keys = {_exclude_key(item) for item in exclude_set}
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
             return tool_name in include_set
-        if exclude_set:
-            return tool_name not in exclude_set
+        if exclude_keys:
+            return _exclude_key(tool_name) not in exclude_keys
         return True
 
     for mcp_tool in server._tools:

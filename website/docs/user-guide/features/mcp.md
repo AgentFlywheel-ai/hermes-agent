@@ -426,6 +426,20 @@ mcp_servers:
 
 All server tools are registered except the excluded ones.
 
+Exclusions match tool names exactly by default. When a server owns its catalog
+and may publish a tool under a different spelling, set
+`exclude_match: casefold` so exclusions compare names with surrounding
+whitespace removed and case folded, on both sides:
+
+```yaml
+tools:
+  exclude: [delete_customer]
+  exclude_match: casefold   # also withholds Delete_Customer, DELETE_CUSTOMER
+```
+
+The tool keeps the spelling the server published for its calls. `include`
+matching is unaffected.
+
 ### Precedence rule
 
 If both are present:

@@ -29,7 +29,8 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
     """Install a fake MCP server in the module's registry.
 
     ``call_tool_impl`` is an async function stored at ``session.call_tool``
-    (it's what the tool handler invokes).
+    (it's what the tool handler invokes). A reconnect attaches a fresh
+    session with the same ``call_tool``, as the real run loop does.
     """
     server = MagicMock()
     server.name = name
@@ -37,6 +38,13 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
     session.call_tool = call_tool_impl
     server.session = session
     server._reconnect_event = MagicMock()
+
+    def _attach_fresh_session():
+        fresh = MagicMock()
+        fresh.call_tool = call_tool_impl
+        server.session = fresh
+
+    server._reconnect_event.set.side_effect = _attach_fresh_session
     server._ready = MagicMock()
     server._ready.is_set.return_value = True
 
