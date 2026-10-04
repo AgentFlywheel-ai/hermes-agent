@@ -146,6 +146,13 @@ def _is_retryable_error(exc: Exception) -> bool:
 # layer can round-trip without understanding Zulip internals.
 # ---------------------------------------------------------------------------
 
+# Zulip's cross-realm system bots (Notification Bot, Welcome Bot, ...) live in the
+# server's internal realm; their messages are announcements, never conversation.
+_SYSTEM_BOT_REALM = "zulip"
+_SYSTEM_BOT_DOMAIN = "@zulip.com"
+# Topic Zulip posts channel-change notices under (description, folder, rename).
+_CHANNEL_EVENTS_TOPIC = "channel events"
+
 _DM_PREFIX = "dm:"
 _GROUP_DM_PREFIX = "group_dm:"
 
@@ -531,6 +538,16 @@ class ZulipAdapter(BasePlatformAdapter):
             if s.strip()
         }
 
+        # Senders whose messages never wake the agent: the deployment's declared
+        # sender-id deny list, plus every bot account in the realm (filled at
+        # connect from the member list).
+        self._blocked_sender_ids: set = {
+            int(s.strip())
+            for s in os.getenv("HERMES_BLOCK_SENDER_IDS", "").split(",")
+            if s.strip().lstrip("-").isdigit()
+        }
+        self._bot_user_ids: set = set()
+
         # Historical context: when the bot is @mentioned in a stream, fetch
         # the last N messages from that stream+topic via Zulip's /messages API
         # and inject them as context before the user's message.  Survives
@@ -700,6 +717,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Populate stream-id cache early (helps typing indicators on first messages).
         self._refresh_stream_cache()
+        self._refresh_bot_user_ids()
         logger.debug("Zulip: adapter fully connected and ready (stream cache has %d entries so far)", len(self._stream_id_cache))
 
         # Start the event queue in a background thread.
@@ -1894,10 +1912,15 @@ class ZulipAdapter(BasePlatformAdapter):
         # catch-up is disabled), so the next (re-)register resumes from here.
         self._advance_catchup_watermark(message)
 
-        # Filter self-messages.
+        # Filter self-messages, system and bot messages, and channel-change notices.
         sender_email = message.get("sender_email", "")
-        sender_id = message.get("sender_id", -1)
-        if sender_email == self._bot_email or sender_id == self._bot_user_id:
+        ignore_reason = self._ignore_reason(message)
+        if ignore_reason:
+            if ignore_reason != "self":
+                logger.debug(
+                    "Zulip: ignoring msg_id=%s from %s (%s)",
+                    msg_id, sender_email, ignore_reason,
+                )
             return
 
         # Schedule async processing on the main event loop.
@@ -2210,6 +2233,45 @@ class ZulipAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Internal: caches & helpers
     # ------------------------------------------------------------------
+
+    def _ignore_reason(self, message: Dict[str, Any]) -> Optional[str]:
+        """Why an inbound message must not reach the agent, or None to process it.
+
+        Self-messages, Zulip system-bot announcements, messages from any bot
+        account in the realm, declared blocked senders, and stream messages in
+        Zulip's ``channel events`` topic are never conversation.
+        """
+        sender_email = str(message.get("sender_email") or "").lower()
+        sender_id = message.get("sender_id", -1)
+        if sender_email == self._bot_email.lower() or sender_id == self._bot_user_id:
+            return "self"
+        if sender_id in self._blocked_sender_ids:
+            return "blocked-sender"
+        if (message.get("sender_realm_str") == _SYSTEM_BOT_REALM
+                or sender_email.endswith(_SYSTEM_BOT_DOMAIN)):
+            return "system-bot"
+        if sender_id in self._bot_user_ids:
+            return "bot"
+        topic = str(message.get("subject") or message.get("topic") or "")
+        if message.get("type") == "stream" and topic.strip().lower() == _CHANNEL_EVENTS_TOPIC:
+            return "channel-events"
+        return None
+
+    def _refresh_bot_user_ids(self) -> None:
+        """Record the realm's bot accounts; a failed read keeps the previous set."""
+        try:
+            result = self._client.get_members() if self._client else {}
+        except Exception as exc:
+            logger.warning("Zulip: could not list realm members for bot filtering — %s", exc)
+            return
+        if not isinstance(result, dict) or result.get("result") != "success":
+            logger.warning("Zulip: realm member list unavailable for bot filtering")
+            return
+        self._bot_user_ids = {
+            m["user_id"]
+            for m in result.get("members", [])
+            if isinstance(m, dict) and m.get("is_bot") and isinstance(m.get("user_id"), int)
+        }
 
     def _refresh_stream_cache(self) -> None:
         """Fetch all streams and cache name ↔ ID mappings."""

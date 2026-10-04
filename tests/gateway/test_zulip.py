@@ -4905,3 +4905,111 @@ class TestZulipZformPrompts:
             assert pending.clarify_id == "clarify-zulip-1"
         finally:
             clarify_gateway.clear_session("zulip:42:ops:alice@example.com")
+
+
+# ---------------------------------------------------------------------------
+# System, bot and channel-event messages never reach the agent
+# ---------------------------------------------------------------------------
+
+
+class TestZulipIgnoredSenders:
+    def setup_method(self):
+        self.adapter = _make_adapter(bot_email="bot@example.zulipchat.com")
+        self.adapter._bot_user_id = 42
+        self.adapter._bot_full_name = "Hermes Bot"
+        self.adapter._bot_user_ids = {77}
+
+    @staticmethod
+    def _stream_msg(msg_id, sender_email, sender_id, topic="bug report", **extra):
+        msg = {
+            "id": msg_id,
+            "sender_email": sender_email,
+            "sender_id": sender_id,
+            "sender_full_name": "x",
+            "type": "stream",
+            "display_recipient": "bugs",
+            "stream_id": 31,
+            "subject": topic,
+            "content": "hello",
+        }
+        msg.update(extra)
+        return msg
+
+    def _dispatched(self, message):
+        """Run the inbound path with a live loop stub; True when dispatch was scheduled."""
+        loop = MagicMock()
+        loop.is_closed.return_value = False
+        self.adapter._loop = loop
+        with patch(
+            "plugins.platforms.zulip.adapter.asyncio.run_coroutine_threadsafe"
+        ) as run:
+            run.side_effect = lambda coro, _loop: (coro.close(), MagicMock())[1]
+            self.adapter._on_zulip_event({"type": "message", "op": "add", "message": message})
+            return run.called
+
+    def test_notification_bot_channel_events_notice_is_ignored(self):
+        msg = self._stream_msg(
+            1, "notification-bot@zulip.com", 5, topic="channel events",
+            sender_realm_str="zulip",
+            content="@_**craydl-agent|24** changed the description for this channel.",
+        )
+        assert self.adapter._ignore_reason(msg) == "system-bot"
+        assert not self._dispatched(msg)
+
+    def test_system_bot_outside_channel_events_is_ignored(self):
+        msg = self._stream_msg(2, "welcome-bot@zulip.com", 6, sender_realm_str="zulip")
+        assert self.adapter._ignore_reason(msg) == "system-bot"
+        assert not self._dispatched(msg)
+
+    def test_realm_bot_account_is_ignored(self):
+        msg = self._stream_msg(3, "alerts-bot@example.zulipchat.com", 77)
+        assert self.adapter._ignore_reason(msg) == "bot"
+        assert not self._dispatched(msg)
+
+    def test_channel_events_topic_is_ignored_by_topic_alone(self):
+        msg = self._stream_msg(4, "person@example.com", 900, topic="Channel Events")
+        assert self.adapter._ignore_reason(msg) == "channel-events"
+        assert not self._dispatched(msg)
+
+    def test_silent_mention_of_own_bot_in_system_notice_is_ignored(self):
+        msg = self._stream_msg(
+            5, "notification-bot@zulip.com", 5, topic="channel events",
+            content="@_**Hermes Bot|42** changed the description for this channel.",
+        )
+        assert self.adapter._ignore_reason(msg) is not None
+        assert not self._dispatched(msg)
+
+    def test_declared_blocked_sender_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("HERMES_BLOCK_SENDER_IDS", "15, 16,bad")
+        adapter = _make_adapter(bot_email="bot@example.zulipchat.com")
+        assert adapter._blocked_sender_ids == {15, 16}
+        msg = self._stream_msg(6, "agent@example.com", 16)
+        assert adapter._ignore_reason(msg) == "blocked-sender"
+
+    def test_human_message_in_free_response_stream_is_processed(self):
+        msg = self._stream_msg(7, "person@example.com", 900)
+        assert self.adapter._ignore_reason(msg) is None
+        assert self._dispatched(msg)
+
+    def test_self_message_still_ignored(self):
+        msg = self._stream_msg(8, "BOT@example.zulipchat.com", 99)
+        assert self.adapter._ignore_reason(msg) == "self"
+
+    def test_bot_ids_come_from_member_list(self):
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_members.return_value = {
+            "result": "success",
+            "members": [
+                {"user_id": 10, "is_bot": True},
+                {"user_id": 11, "is_bot": False},
+                {"user_id": "x", "is_bot": True},
+            ],
+        }
+        self.adapter._refresh_bot_user_ids()
+        assert self.adapter._bot_user_ids == {10}
+
+    def test_member_list_failure_keeps_previous_bot_ids(self):
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_members.side_effect = RuntimeError("down")
+        self.adapter._refresh_bot_user_ids()
+        assert self.adapter._bot_user_ids == {77}
