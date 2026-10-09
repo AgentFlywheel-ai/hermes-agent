@@ -2636,7 +2636,15 @@ class MCPServerTask:
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
         self._task = asyncio.ensure_future(self.run(config))
-        await self._ready.wait()
+        try:
+            await self._ready.wait()
+        except asyncio.CancelledError:
+            # The caller stopped waiting (startup connect timeout). Nothing
+            # else holds a reference to this task, so a transport still hung
+            # mid-connect would otherwise live on unowned.
+            if not self._task.done():
+                self._task.cancel()
+            raise
         if self._error:
             raise self._error
 
@@ -2694,6 +2702,8 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+# Background retries for servers whose first connect timed out at startup.
+_startup_retry_tasks: Dict[str, "asyncio.Task"] = {}
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -4512,16 +4522,85 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     return registered_names
 
 
+class _StartupConnectTimeout(asyncio.TimeoutError):
+    """The server did not finish connecting within ``connect_timeout``.
+
+    Distinct from an error raised by the server task itself: that task has
+    already run its own initial-connect retries and logged the outcome, while
+    a timeout means it never got an answer and nothing has been retried.
+    """
+
+
+async def _retry_startup_connect(name: str, config: dict, first_error: BaseException) -> None:
+    """Retry a server whose first connect timed out during startup discovery.
+
+    A server that accepts the connection but never answers (for example while
+    it is being redeployed) exhausts ``connect_timeout`` without ever entering
+    the server task's own initial-connect retry. Without this it would stay
+    unregistered until the process restarts. Retries use the initial-connect
+    budget and backoff; on success the server's tools are registered for
+    sessions created afterward, and on exhaustion the give-up line is logged.
+    """
+    backoff = 1.0
+    error = first_error
+    try:
+        for attempt in range(1, _MAX_INITIAL_CONNECT_RETRIES + 1):
+            logger.warning(
+                "MCP server '%s' initial connection failed "
+                "(attempt %d/%d), retrying in %.0fs: %s",
+                name, attempt, _MAX_INITIAL_CONNECT_RETRIES, backoff, error,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+            with _lock:
+                if name in _servers:
+                    return
+            try:
+                await _discover_and_register_server(name, config)
+                return
+            except _StartupConnectTimeout as exc:
+                error = exc
+            except Exception as exc:
+                # Raised by the server task, which has already retried and
+                # logged its own outcome (including any give-up line).
+                message = _format_connect_error(exc)
+                with _lock:
+                    _server_connect_errors[name] = message
+                logger.warning(
+                    "Failed to connect to MCP server '%s': %s", name, message,
+                )
+                return
+        logger.warning(
+            "MCP server '%s' failed initial connection after "
+            "%d attempts, giving up: %s",
+            name, _MAX_INITIAL_CONNECT_RETRIES, error,
+        )
+    finally:
+        with _lock:
+            _server_connecting.discard(name)
+            if _startup_retry_tasks.get(name) is asyncio.current_task():
+                del _startup_retry_tasks[name]
+
+
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
+    connect = asyncio.ensure_future(_connect_server(name, config))
+    try:
+        done, _ = await asyncio.wait({connect}, timeout=connect_timeout)
+    except asyncio.CancelledError:
+        connect.cancel()
+        raise
+    if not done:
+        connect.cancel()
+        await asyncio.gather(connect, return_exceptions=True)
+        raise _StartupConnectTimeout(
+            f"no response within {connect_timeout:g}s (connect_timeout)"
+        )
+    server = connect.result()
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
@@ -4570,7 +4649,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in _servers
+            and k not in _startup_retry_tasks
+            and _parse_boolish(v.get("enabled", True), default=True)
         }
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
@@ -4612,6 +4693,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     f" (command={command})" if command else "",
                     message,
                 )
+                if isinstance(result, _StartupConnectTimeout):
+                    with _lock:
+                        _server_connecting.add(name)
+                        _startup_retry_tasks[name] = asyncio.ensure_future(
+                            _retry_startup_connect(name, new_servers[name], result)
+                        )
             else:
                 with _lock:
                     _server_connecting.discard(name)
@@ -5081,13 +5168,17 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+        retries_snapshot = list(_startup_retry_tasks.values())
 
     # Fast path: nothing to shut down.
-    if not servers_snapshot:
+    if not servers_snapshot and not retries_snapshot:
         _stop_mcp_loop()
         return
 
     async def _shutdown():
+        for task in retries_snapshot:
+            task.cancel()
+        await asyncio.gather(*retries_snapshot, return_exceptions=True)
         results = await asyncio.gather(
             *(server.shutdown() for server in servers_snapshot),
             return_exceptions=True,
