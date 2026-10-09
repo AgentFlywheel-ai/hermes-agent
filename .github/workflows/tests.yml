@@ -87,7 +87,9 @@ jobs:
         # `uv venv` step is needed.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev
+          # The zulip extra is lazy-installed at runtime and so is not in
+          # [all]; the Zulip platform and tool tests import the SDK directly.
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra zulip
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
